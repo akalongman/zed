@@ -2386,9 +2386,7 @@ impl Workspace {
                 && !opened_items.is_empty()
                 && opened_items.iter().all(Option::is_none)
                 && let Ok(task) = window.update(cx, |_, window, cx| {
-                    workspace.update(cx, |workspace, cx| {
-                        workspace.open_readme(None, true, window, cx)
-                    })
+                    workspace.update(cx, |workspace, cx| workspace.open_readme(window, cx))
                 })
             {
                 task.await;
@@ -4036,7 +4034,6 @@ impl Workspace {
         abs_paths.sort_unstable();
         cx.spawn_in(window, async move |workspace, cx| {
             let mut tasks = Vec::with_capacity(abs_paths.len());
-            let mut open_readme = !abs_paths.is_empty();
 
             for abs_path in &abs_paths {
                 let visible = match options.visible.as_ref().unwrap_or(&OpenVisible::None) {
@@ -4070,8 +4067,6 @@ impl Workspace {
                     },
                     None => None,
                 };
-
-                open_readme &= project_path.is_some();
 
                 let workspace = workspace.clone();
                 let abs_path: Arc<Path> = SanitizedPath::new(&abs_path).as_path().into();
@@ -4200,15 +4195,6 @@ impl Workspace {
                         })
                         .ok();
                 }
-            }
-
-            if open_readme
-                && results.iter().all(Option::is_none)
-                && let Ok(task) = workspace.update_in(cx, |workspace, window, cx| {
-                    workspace.open_readme(pane, options.focus.unwrap_or(true), window, cx)
-                })
-            {
-                task.await;
             }
 
             results
@@ -5349,13 +5335,7 @@ impl Workspace {
         })
     }
 
-    fn open_readme(
-        &mut self,
-        pane: Option<WeakEntity<Pane>>,
-        focus_item: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Task<()> {
+    fn open_readme(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Task<()> {
         if WorkspaceSettings::get_global(cx).on_new_window != settings::OnNewWindow::Readme
             || self.items(cx).next().is_some()
         {
@@ -5364,10 +5344,27 @@ impl Workspace {
 
         let project = self.project.clone();
         let worktrees = project.read(cx).visible_worktrees(cx).collect::<Vec<_>>();
-        let pane = pane.unwrap_or_else(|| self.active_pane().downgrade());
+        let listings = worktrees
+            .into_iter()
+            .filter_map(|worktree| {
+                let worktree = worktree.read(cx);
+                if worktree.root_entry().is_some_and(|entry| entry.is_file()) {
+                    return None;
+                }
+                let worktree_id = worktree.id();
+                let abs_path = worktree.abs_path().to_string_lossy().into_owned();
+                let listing =
+                    project.update(cx, |project, cx| project.list_directory(abs_path, cx));
+                Some(async move { (worktree_id, listing.await) })
+            })
+            .collect::<Vec<_>>();
+        let pane = self.active_pane().downgrade();
         cx.spawn_in(window, async move |workspace, cx| {
-            for worktree in worktrees {
-                for path in [
+            for (worktree_id, listing) in futures::future::join_all(listings).await {
+                let Some(entries) = listing.log_err() else {
+                    continue;
+                };
+                for file_name in [
                     "README.md",
                     "readme.md",
                     "Readme.md",
@@ -5378,21 +5375,15 @@ impl Workspace {
                     "readme.txt",
                     "Readme.txt",
                 ] {
-                    let Some(path) = RelPath::from_unix_str(path).ok() else {
-                        continue;
-                    };
-                    let (worktree_id, metadata) = worktree.read_with(cx, |worktree, cx| {
-                        let abs_path = worktree.absolutize(path);
-                        (
-                            worktree.id(),
-                            project
-                                .read(cx)
-                                .resolve_abs_path(&abs_path.to_string_lossy(), cx),
-                        )
-                    });
-                    if !metadata.await.is_some_and(|path| path.is_file()) {
+                    if !entries
+                        .iter()
+                        .any(|entry| !entry.is_dir && entry.path.as_path() == Path::new(file_name))
+                    {
                         continue;
                     }
+                    let Some(path) = RelPath::from_unix_str(file_name).ok() else {
+                        continue;
+                    };
                     let path = ProjectPath {
                         worktree_id,
                         path: Arc::from(path),
@@ -5410,7 +5401,9 @@ impl Workspace {
                     }) else {
                         return;
                     };
-                    let result = task.await;
+                    let Some((entry_id, build_item)) = task.await.log_err() else {
+                        continue;
+                    };
                     workspace
                         .update_in(cx, |workspace, window, cx| {
                             if WorkspaceSettings::get_global(cx).on_new_window
@@ -5423,10 +5416,7 @@ impl Workspace {
                             let Some(pane) = pane.upgrade() else {
                                 return;
                             };
-                            let Some((entry_id, build_item)) = result.log_err() else {
-                                return;
-                            };
-                            let focus_item = focus_item && workspace.owns_window_chrome();
+                            let focus_item = workspace.owns_window_chrome();
                             pane.update(cx, |pane, cx| {
                                 pane.open_item(
                                     entry_id, path, focus_item, true, true, None, window, cx,
@@ -11737,9 +11727,7 @@ async fn open_remote_project_inner(
     if project_path_errors.is_empty()
         && items.iter().all(Option::is_none)
         && let Ok(task) = window.update(cx, |_, window, cx| {
-            workspace.update(cx, |workspace, cx| {
-                workspace.open_readme(None, true, window, cx)
-            })
+            workspace.update(cx, |workspace, cx| workspace.open_readme(window, cx))
         })
     {
         task.await;
